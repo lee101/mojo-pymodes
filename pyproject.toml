@@ -4,10 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mojo-pymodes"
-version = "0.1.0"
+version = "1.0.0"
 description = "pyModeS's ADS-B decoding primitives, in Mojo"
 readme = "README.md"
-license = "MIT"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["numpy", "pymodes==3.6.0"]
 
@@ -16,3 +17,19 @@ dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/mojopymodes"]
+
+[tool.hatch.build.targets.sdist]
+# The wheel ships the Python package only; the Mojo sources, the table
+# generator, the build script and the tests travel in the sdist so a reader
+# of the GPL-licensed port can get its source (LICENSE covers both).
+include = [
+  "/python",
+  "/src",
+  "/build",
+  "/tests",
+  "/bench",
+  "/README.md",
+  "/LICENSE",
+  "/pixi.toml",
+  "/pixi.lock",
+]

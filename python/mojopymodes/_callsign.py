@@ -30,5 +30,13 @@ def decode_callsigns(bits) -> list[str]:
 
 
 def is_valid_callsign_char(idx: int) -> bool:
-    """True if a 6-bit index maps to a valid callsign character."""
+    """True if a 6-bit index maps to a valid callsign character.
+
+    A negative index is Python's "from the end", which upstream answers; an
+    index outside -64..63 is an IndexError there, and the wrapper raises it
+    too so the two have the same contract.
+    """
+    idx = int(idx)
+    if idx > 63 or idx < -64:
+        raise IndexError("string index out of range")
     return bool(lib().mp_is_valid_callsign_char(idx))

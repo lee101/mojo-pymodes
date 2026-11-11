@@ -42,7 +42,14 @@ def crc_table() -> list[int]:
 
 
 def callsign_table() -> list[int]:
-    """pyModeS._callsign._build_table(), as ordinals."""
+    """pyModeS._callsign._build_table(), as ordinals.
+
+    Upstream's table has `chr(0)` at index 0 (it only checks `!= "#"`),
+    but a NUL in the table is a NUL in the C ABI's string buffer, so index 0
+    carries the `#` sentinel instead. No slot can produce index 0 through the
+    decoder (a padded callsign uses index 32, the space), and the only
+    observable difference is `is_valid_callsign_char(0)`, which is False.
+    """
     out = []
     for i in range(64):
         if 1 <= i <= 26:

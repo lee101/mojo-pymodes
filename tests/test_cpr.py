@@ -187,3 +187,34 @@ def test_position_round_trip_through_a_known_pair():
     again = airborne_position_with_ref(0, lat_even, lon_even, *pos)
     assert abs(again[0] - pos[0]) < 1e-9
     assert abs(again[1] - pos[1]) < 1e-9
+
+
+def test_batch_position_decoders_refuse_columns_of_different_length():
+    """Every column a batch kernel reads must be one value per message.
+
+    The kernels read `n` elements from each column, so a scalar reference or a
+    short list would be read past its end; the wrappers reject that instead.
+    """
+    import pytest
+
+    n = 4
+    lat = [93000, 93001, 93002, 93003]
+    lon = [100000, 100001, 100002, 100003]
+    newer = [1, 0, 1, 0]
+    cases = [
+        (airborne_position_pair_batch, (lat, lon, lat, lon[:3], newer)),
+        (airborne_position_pair_batch, (lat, lon, lat, lon, 1)),
+        (airborne_position_with_ref_batch, ([0] * n, lat, lon, 51.0, [0.0] * n)),
+        (surface_position_with_ref_batch, ([0] * n, lat, lon, [51.0] * (n - 1), [0.0] * n)),
+        (surface_position_pair_batch, (lat, lon, lat, lon, 51.0, 0.0, newer[:2])),
+    ]
+    for fn, columns in cases:
+        with pytest.raises(ValueError):
+            fn(*columns)
+    # Equal lengths still decode, and agree with the scalar function.
+    got = airborne_position_pair_batch(lat, lon, lat, lon, newer)
+    want = [
+        ref_pair(a, b, c, d, even_is_newer=bool(k))
+        for a, b, c, d, k in zip(lat, lon, lat, lon, newer)
+    ]
+    assert got == want

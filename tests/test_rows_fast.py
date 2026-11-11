@@ -20,10 +20,10 @@ import random
 import numpy as np
 import pytest
 
-from mojopymodes._layout import LAYOUTS, _FAST, rows, rows_generic
+from mojopymodes._layout import LAYOUTS, _BUILDERS, rows, rows_generic
 
-FAST_NAMES = sorted(_FAST)
-GENERIC_NAMES = sorted(set(LAYOUTS) - set(_FAST))
+FAST_NAMES = sorted(_BUILDERS)
+GENERIC_NAMES = sorted(set(LAYOUTS) - set(_BUILDERS))
 
 # Fields whose value is used as an index or a small enum, so a random large
 # value would be nonsense (and would index off the end of a lookup list).
@@ -32,6 +32,7 @@ FIELD_RANGE = {
     ("bds09", 9): (0, 1),  # vr_source
     ("bds62", 4): (0, 2),  # selected_altitude_source
     ("header", 6): (0, 1),  # crc_valid
+    ("bds08", 3): (0, 17),  # wake_vortex index into the name table
     ("header", 8): (0, 2**13 - 1),  # idcode (octal squawk)
 }
 
@@ -220,9 +221,23 @@ def test_astype_conversion_is_exact_for_the_int64_fields():
         assert out.astype(np.int64).tolist() == vals, name
 
 
-def test_squawk_helper_matches_upstream():
-    from mojopymodes._layout import _squawk
+def test_header_rows_squawk_goes_through_the_kernel():
+    """`rows("header", ...)` has no Python squawk of its own any more: the ID
+    field is handed to the ported `idcode_to_squawk` kernel, so a broken
+    `mp_idcode_to_squawk_batch` has to fail here and not only in test_kernels."""
+    import mojopymodes._layout as layout
     from pyModeS._idcode import idcode_to_squawk as ref_squawk
 
-    for ident in range(0, 8192, 7):
-        assert _squawk(ident) == ref_squawk(ident)
+    assert not hasattr(layout, "_squawk"), "a Python squawk duplicate is back"
+    codes = list(range(0, 8192, 7))
+    built = [{"idcode": c} for c in codes]
+    layout._squawks(built)
+    assert [r["idcode"] for r in built] == [ref_squawk(c) for c in codes]
+
+
+def test_squawk_rows_without_idcode_are_left_alone():
+    import mojopymodes._layout as layout
+
+    built = [{"df": 17}, {"df": 5, "idcode": None}, {"df": 5}]
+    assert layout._squawks(built) is built
+    assert built == [{"df": 17}, {"df": 5, "idcode": None}, {"df": 5}]

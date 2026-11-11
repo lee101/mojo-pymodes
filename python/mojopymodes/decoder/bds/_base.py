@@ -8,7 +8,7 @@ exercise the same kernel the batch API uses.
 from __future__ import annotations
 
 from ..._layout import LAYOUTS, rows
-from ..._lib import addr, i64, lib, out_f64, out_u8
+from ..._lib import addr, i64, lib, out_f64, out_u8, same_length
 
 
 def _run(name: str, payloads, extra=None) -> list[dict]:
@@ -17,6 +17,11 @@ def _run(name: str, payloads, extra=None) -> list[dict]:
     n = p.size
     if n == 0:
         return []
+    # The kernel reads exactly `n` elements of every input column. A shorter
+    # column (a scalar, or a list of a different length) would make it read
+    # past the caller's buffer, so it is refused here instead of at the FFI.
+    if extra is not None:
+        same_length(name, p, extra)
     out = out_f64(n, layout.width)
     buf = out_u8(n, layout.char_stride) if layout.char_stride else None
     fn = getattr(lib(), "mp_decode_" + name)

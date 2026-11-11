@@ -3,7 +3,7 @@ authors = ["Lee Penkman <leepenkman@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "mojo-pymodes"
 platforms = ["linux-64"]
-version = "0.1.0"
+version = "1.0.0"
 
 [tasks]
 build = "bash build/build.sh"
@@ -14,8 +14,8 @@ bench = "flock /tmp/mojo-bench.lock python bench/bench.py"
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
-max = "==26.7.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+max = "==26.7.0.dev2026092905"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"

@@ -12,6 +12,10 @@ A `Field` is `(name, kind, slot, bit, transform, char_offset, char_width)`:
             "h" 6 uppercase hex digits from the char block
   bit       this field's bit in the present / absent masks
   transform optional value mapping applied after the numeric read
+
+The idcode field of the header has no transform: its octal squawk comes from
+the ported `idcode_to_squawk` kernel, run once over a whole batch by
+`_squawks`, rather than from a second Python implementation of it.
 """
 
 from __future__ import annotations
@@ -37,19 +41,34 @@ class Layout(NamedTuple):
     fields: tuple[Field, ...]
 
 
-def _squawk(value: float) -> str:
-    """13-bit ID field to a 4-digit octal squawk, as pyModeS._idcode does.
+def _squawks(rows_in: list[dict]) -> list[dict]:
+    """Turn the header rows' raw 13-bit ID fields into octal squawk strings.
 
-    Each digit is three interleaved pulse bits: A = A4 A2 A1 at payload
-    positions 5, 3, 1; B = B4 B2 B1 at 11, 9, 7; C = C4 C2 C1 at 4, 2, 0;
-    D = D4 D2 D1 at 12, 10, 8. Position p is LSB bit 12 - p.
+    The conversion is the ported `idcode_to_squawk` kernel, run once over the
+    whole batch rather than reimplemented here: a Python copy of it would be a
+    second implementation of an algorithm that already lives in Mojo, and
+    nothing would observe the two drifting apart.
     """
-    ident = int(value)
-    digits = []
-    for hi, mid, lo in ((7, 9, 11), (1, 3, 5), (8, 10, 12), (0, 2, 4)):
-        digit = ((ident >> hi) & 1) << 2 | ((ident >> mid) & 1) << 1 | ((ident >> lo) & 1)
-        digits.append(chr(48 + digit))
-    return "".join(digits)
+    from ._idcode import idcodes_to_squawks
+
+    # A raw field is an int (or a float straight out of the buffer); a squawk
+    # that has already been through this function is the octal string the
+    # kernel wrote. Only the former is converted, so calling this twice on the
+    # same list leaves the squawks alone instead of decoding them again.
+    def _raw(value: Any) -> bool:
+        return not isinstance(value, str)
+
+    at = [
+        i
+        for i, r in enumerate(rows_in)
+        if r.get("idcode") is not None and _raw(r["idcode"])
+    ]
+    if not at:
+        return rows_in
+    codes = idcodes_to_squawks([rows_in[i]["idcode"] for i in at])
+    for i, code in zip(at, codes):
+        rows_in[i]["idcode"] = code
+    return rows_in
 
 
 def _icao(value: float) -> str:
@@ -139,7 +158,7 @@ LAYOUTS: dict[str, Layout] = {
             Field("crc", "i", 5, 3),
             Field("crc_valid", "b", 6, 4, _bool),
             Field("altitude", "i", 7, 5),
-            Field("idcode", "i", 8, 6, _squawk),
+            Field("idcode", "i", 8, 6),
         ),
     ),
     "bds05": Layout(
@@ -262,55 +281,180 @@ for _name, _layout in LAYOUTS.items():
     assert len(set(_bits)) == len(_bits), (_name, "duplicate bit")
 
 
-_NUMERIC = {"i": int, "f": float, "b": _bool}
+# ------------------------------------------------------------ column planning
+#
+# A row is not built by testing every field of every row. The batch is read
+# once in numpy first, so the common shapes are already resolved:
+#
+#   floats  the buffer's own float view, shaped rows by slots
+#   hexes   the layout's address slot as six ASCII digits per row, one gather
+#           into a 16 MiB byte table for the whole batch, used only when every
+#           address fits 24 bits (which the kernels write; the format string
+#           is the exact fallback)
+#   blob    the char strip, split once rather than sliced per entry
+#   ever    the OR of every row's absent mask, so a builder can skip a `None`
+#           branch that no row in the batch reaches
+#
+# Then one loop per layout walks the rows. The loop reads each row's own
+# present and absent masks for the keys that can be missing or `None`, and
+# emits the keys in the layout's field order, which is what `rows_generic`
+# does. `rows_generic` is the reference implementation, written the obvious
+# way over a flat `tolist()`; `tests/test_rows_fast.py` and
+# `tests/test_builders.py` compare the builders against it on every mask.
+
+_DIGITS = np.frombuffer(b"0123456789ABCDEF", dtype=np.uint8)
+# _HEX_TABLE[v] is the six ASCII digits of v, so the addresses of a whole batch
+# become six bytes each in one gather and one copy.
+_HEX_TABLE = np.stack(
+    [_DIGITS[((np.arange(1 << 24, dtype=np.uint32) >> (4 * (5 - k))) & 0xF)] for k in range(6)],
+    axis=1,
+)
+_HEX_TABLE.setflags(write=False)
+
+
+_COERCE = {"i": int, "f": float, "b": _bool}
+
+# field name -> its kind, for the plans that carry a transform on an int field
+_KINDS = {name: {f.name: f.kind for f in layout.fields} for name, layout in LAYOUTS.items()}
+
+
+def _kind(field: Field) -> str:
+    """How a row loop reads one field.
+
+    `rows_generic` applies a field's transform only after it has coerced the
+    value, so a float or bool field with a transform has one; an int field's
+    transform is dead code there. The plan records which, so both loops agree.
+    """
+    if field.kind in ("c", "h"):
+        return "c"
+    if field.kind in _COERCE and field.transform is not None:
+        return "t"
+    if field.transform is _icao:
+        return "x"
+    return field.kind
 
 
 def _plan(layout: Layout) -> tuple:
-    """Field tuples with the coercion resolved once, not once per field per row.
-
-    Reading a million rows is the dominant cost of the whole batch path, so
-    the inner loop does no attribute lookups and no dict indexing.
-    """
-    out = []
-    for f in layout.fields:
-        out.append(
-            (
-                f.name,
-                None if f.kind in ("c", "h") else _NUMERIC[f.kind],
-                f.slot,
-                f.bit,
-                f.transform,
-            )
-        )
-    return tuple(out)
+    """(name, kind, slot, bit, char width, transform) per field."""
+    return tuple(
+        (f.name, _kind(f), f.slot, f.bit, CHARS.get(f.name, 0), f.transform)
+        for f in layout.fields
+    )
 
 
 _PLANS = {name: _plan(layout) for name, layout in LAYOUTS.items()}
+
+# The layouts a fused builder below covers. It is empty until the builders are
+# defined, at the end of the file.
+_BUILDERS: dict[str, Callable] = {}
+
+
+def _missing(floats: np.ndarray, bits: int) -> bool:
+    """True when some row does not carry every key in `bits`.
+
+    A key absent from a row is left out of its dict, which is a different
+    answer from a key present with a `None` value, so a builder has to see it
+    too. It is one AND-and-compare over the present column, and for a batch
+    where every row carries the keys -- what the kernels produce for any real
+    capture -- the result is `False` and the row loop has no branch for it.
+    """
+    if not len(floats):
+        return False
+    return bool(np.any((floats[:, 0].astype(np.int64) & bits) != bits))
+
+
+def _strings(blob: bytes, n: int, stride: int) -> list[str]:
+    """`n` NUL-terminated entries of `stride` bytes each, as strings.
+
+    One `split` over the whole strip, not one slice per entry: every entry the
+    kernels write is terminated, so with `maxsplit = n` the result has exactly
+    `n` elements whatever follows the last terminator. A strip with no
+    terminator at all -- only a synthetic buffer in the tests -- is read on the
+    stride instead.
+    """
+    if not n:
+        return []
+    parts = blob.split(b"\x00", n)
+    if len(parts) != n:
+        return [
+            blob[i * stride : (i + 1) * stride].split(b"\x00", 1)[0].decode("latin-1")
+            for i in range(n)
+        ]
+    return [p.decode("latin-1") for p in parts]
+
+
+def _columns(name: str, out: np.ndarray, chars: np.ndarray | None):
+    """(width, floats, hexes, blob, ever, present) for one result buffer.
+
+    `hexes` and `blob` are the two batch-level formats, left empty when the
+    layout has no such field (or, for `hexes`, when an address does not fit
+    the six-digit table). `present` is the first row's mask; a builder only
+    uses it where the whole batch is known to share one.
+    """
+    layout = LAYOUTS[name]
+    width = layout.width
+    n = out.size // width
+    # The float view, not a rounded copy: a builder that reads a slot with
+    # `int()` has to see the fraction to know whether there is one, and the
+    # rounded column is taken per slot inside the builder.
+    floats = out.reshape(n, width)
+    ever = int(floats[:, 1].max()) if n else 0
+    hexes = _hexes(name, floats) if n and _fits_hex(name, floats) else []
+    blob = chars.tobytes() if (layout.char_stride and chars is not None and n) else b""
+    present = int(floats[0, 0]) if n else 0
+    return width, floats, hexes, blob, ever, present
+
+
+def _fits_hex(name: str, floats: np.ndarray) -> bool:
+    """True when every address in the batch fits the table and the format."""
+    for _, kind, slot, _, _, _ in _PLANS[name]:
+        if kind == "x":
+            column = floats[:, slot]
+            return bool(column.min() >= 0 and column.max() < 1 << 24)
+    return False
+
+
+def _hexes(name: str, floats: np.ndarray) -> list[str]:
+    """The address column as one six-digit string per row, or `[]`.
+
+    `ndarray.tolist()` on a fixed-width byte array yields one `bytes` per row
+    in C, which is the cheapest way to cut a six-byte-per-row strip into
+    strings; a Python slicing loop over the flattened blob is 4x slower.
+    """
+    for _, kind, slot, _, _, _ in _PLANS[name]:
+        if kind == "x":
+            # `& 0xFFFFFF` rather than a test: the kernels write a 24-bit
+            # address, and a synthetic buffer with a wider one would otherwise
+            # read past the table. The last six digits are what `f"{v:06X}"`
+            # of the masked value gives, and the generic loop reads the value
+            # only on a row whose absent mask clears this bit.
+            rows = _HEX_TABLE[floats[:, slot].astype(np.int64) & 0xFFFFFF]
+            return [b.decode("ascii") for b in rows.tolist()]
+    return []
 
 
 def rows(name: str, out: np.ndarray, chars: np.ndarray | None = None) -> list[dict]:
     """Turn the kernel's flat output into the list of dicts upstream returns.
 
-    A layout that has a hand-written fast path goes through it; the fast path
-    handles the shapes real traffic produces (every key present, every value
-    non-`None`) in one dict literal and falls back to `rows_generic` for the
-    rest, so the result is identical either way.
+    A planned layout goes through its builder, which sends any row shape it
+    does not cover to `_ordered`; anything else goes through `rows_generic`.
+    Both produce exactly the rows `rows_generic` produces, which
+    `tests/test_rows_fast.py` and `tests/test_builders.py` assert on every mask.
     """
-    fast = _FAST.get(name)
-    if fast is not None:
-        return fast(out, chars)
-    return rows_generic(name, out, chars)
+    build = _BUILDERS.get(name)
+    if build is None:
+        return rows_generic(name, out, chars)
+    result = build(*_columns(name, out, chars))
+    return _squawks(result) if name == "header" else result
 
 
 def rows_generic(name: str, out: np.ndarray, chars: np.ndarray | None = None) -> list[dict]:
-    """The field-plan loop: one branch per field per row, any shape of result."""
+    """The reference builder: a field-plan loop over a flat buffer."""
     layout = LAYOUTS[name]
     plan = _PLANS[name]
     # One tolist() over the flat buffer beats numpy scalar indexing by an
     # order of magnitude, and the rows become Python dicts either way.
     table = out.tolist()
-    # One bytes copy of the whole char strip, sliced per row: taking a numpy
-    # view per row instead costs more than the decode it is reading.
     blob = chars.tobytes() if (layout.char_stride and chars is not None) else b""
     stride = layout.char_stride
     result: list[dict[str, Any]] = []
@@ -321,283 +465,427 @@ def rows_generic(name: str, out: np.ndarray, chars: np.ndarray | None = None) ->
         present = int(row[0])
         absent = int(row[1])
         item: dict[str, Any] = {}
-        for field, coerce, slot, bit, transform in plan:
+        for field, kind, slot, bit, char_width, transform in plan:
             if not (present >> bit) & 1:
                 continue
             if (absent >> bit) & 1:
                 item[field] = None
-            elif coerce is None:
+            elif kind == "c":
                 base = (i // width) * stride
-                item[field] = blob[base : base + CHARS[field]].split(b"\x00", 1)[0].decode("ascii")
+                item[field] = (
+                    blob[base : base + char_width].split(b"\x00", 1)[0].decode("latin-1")
+                )
+            elif kind == "x":
+                item[field] = f"{int(row[slot]):06X}"
+            elif kind == "b":
+                item[field] = bool(row[slot])
+            elif kind == "i":
+                item[field] = int(row[slot])
+            elif kind == "t":
+                item[field] = transform(_COERCE[_KINDS[name][field]](row[slot]))
             else:
-                value = coerce(row[slot])
-                item[field] = transform(value) if transform else value
+                item[field] = row[slot]
         append(item)
-    return result
+    return _squawks(result) if name == "header" else result
 
 
-# ----------------------------------------------------------------- fast paths
+# ------------------------------------------------------------ fused builders
 #
-# `rows_generic` above costs a presence test, a `None` test, a coercion call
-# and a transform call for every field of every row. Real traffic does not hit
-# that: a decoded message normally has every key present and every value
-# non-`None`, so one dict literal per row does the same work as a C-level
-# constant-key map with no per-field branching.
-#
-# Two more things fall out of that shape:
-#
-#   * Integer slots are converted once, in numpy, with `astype(np.int64)`, so
-#     Python builds the ints during one `tolist()` instead of `int()` being
-#     called once per field per row. It is a conversion, not a `.view()`: the
-#     kernel stores an integer as a `Float64`, so its bit pattern is the
-#     float's, and reinterpreting would read garbage.
-#   * Whether any key was `None` anywhere in the batch is one numpy reduction
-#     up front, not a test per field per row.
-#
-# Every fast path hands the whole buffer back to `rows_generic` as soon as it
-# meets a row it does not handle, so the two can never disagree about a value.
-# `tests/test_rows_fast.py` asserts that on random masks.
+# Each builder is the field plan of one layout, unrolled: straight-line code
+# over columns read once, with a test per key only where the kernels can leave
+# the key out or set it to `None`. Shapes a builder is not written for -- a
+# key set that differs from row to row in a way the merged loop cannot express
+# -- go to `_ordered`, the same field plan over the int64 view, which is
+# `rows_generic` for every mask a kernel or a test can produce.
 
 
-def _ints(out: np.ndarray) -> list:
-    """The whole buffer as a flat list of Python ints, in one numpy pass."""
-    return out.astype(np.int64).tolist()
+def _ordered(floats, width, blob, hexes, name):
+    """The rows of a buffer that a builder's own loop does not cover.
 
-
-def _strings(chars: np.ndarray, n: int, stride: int) -> list[str]:
-    """The char strip as a list of n strings.
-
-    Variable-length entries cannot be recovered by splitting the strip once: a
-    short string leaves padding NULs behind and the split would report them as
-    empty entries. So each slot is sliced and trimmed at its own terminator.
+    `rows_generic`'s field plan, over the int64 view instead of a flat float
+    list, so keys come out in the layout's order and float fields keep the
+    fraction a round trip through int64 would drop.
     """
-    if n == 0:
-        return []
-    blob = chars.tobytes()
-    return [
-        blob[i * stride : (i + 1) * stride].split(b"\x00", 1)[0].decode("ascii")
-        for i in range(n)
-    ]
+    n = floats.size // width
+    rows_: list[dict] = []
+    append = rows_.append
+    plan = _PLANS[name]
+    stride = LAYOUTS[name].char_stride
+    block = floats.astype(np.int64).reshape(n, width).tolist()
+    # Float fields are read from the float view: rounding them through the
+    # int64 block would drop the fraction before `rows_generic` ever saw it.
+    real = floats.reshape(n, width).tolist()
+    for k in range(n):
+        row = block[k]
+        real_row = real[k]
+        p = row[0]
+        m = row[1]
+        item: dict = {}
+        for field, kind, slot, bit, char_width, transform in plan:
+            if not (p >> bit) & 1:
+                continue
+            if (m >> bit) & 1:
+                item[field] = None
+            elif kind not in ("c", "x", "t", "i", "b"):
+                item[field] = real_row[slot]
+            elif kind == "c":
+                at = k * stride
+                item[field] = blob[at : at + char_width].split(b"\x00", 1)[0].decode("latin-1")
+            elif kind == "x":
+                item[field] = f"{row[slot]:06X}"
+            elif kind == "t":
+                item[field] = transform(_COERCE[_KINDS[name][field]](row[slot]))
+            elif kind == "i":
+                item[field] = row[slot]
+            elif kind == "b":
+                item[field] = bool(row[slot])
+            else:
+                item[field] = float(row[slot])
+        append(item)
+    return rows_
 
 
-def _uniform_masks(out: np.ndarray, width: int):
-    """The present mask when every row of the batch carries the same one.
+def _build_header(width, floats, hexes, blob, ever, present):
+    """util.headers. `idcode` stays the raw 13-bit field; `rows` squawks it.
 
-    The kernels write a present mask that is a constant of the register --
-    bds09 is the only one that varies, and it has its own fast path for each of
-    its two shapes -- so a batch whose rows disagree about which keys exist has
-    no single dict shape and goes to the generic loop.
+    Every key except `crc` and `crc_valid` can be missing on a row or `None`,
+    so the loop reads each row's own present and absent masks. `icao` is six
+    hex digits: the batch-level table when every address fits 24 bits, and
+    `f"{v:06X}"` otherwise, which is what the generic loop does.
     """
-    frame = out.reshape(-1, width)
-    if frame.shape[0] == 0:
-        return 0
-    present = frame[:, 0].astype(np.int64)
-    if bool((present != present[0]).any()):
-        return None
-    return int(present[0])
-
-
-def _no_unexpected_none(out: np.ndarray, width: int, optional: int) -> bool:
-    """True when no row marks a field `None` that the fast path does not read.
-
-    A fast path handles the register's optional fields by testing their absent
-    bits inline. If a row ever set an absent bit outside that set, the fast path
-    would read a value where the generic loop returns `None`. One numpy pass
-    over the absent column rules that out for the whole batch, which makes the
-    fast path equivalent to `rows_generic` for any input rather than only for
-    the masks the kernels happen to produce.
-    """
-    absent = out.reshape(-1, width)[:, 1].astype(np.int64)
-    return not bool((absent & ~optional).any())
-
-
-def _fast_bds05(out, chars=None):
-    if _uniform_masks(out, 9) != 0x7F or not _no_unexpected_none(out, 9, 1):
-        return rows_generic("bds05", out, chars)
-    # One 2-D conversion so the loop walks per-row lists rather than striding a
-    # nine-million-element flat list. Only `altitude` can be None on a BDS 0,5
-    # row (bit 0), which is why the rest need no test.
-    ints = out.reshape(-1, 9).astype(np.int64).tolist()
-    result = []
-    append = result.append
-    for r in ints:
-        m = r[1]
-        append(
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    df = ints[:, 2].tolist()
+    tc = ints[:, 4].tolist()
+    crc = ints[:, 5].tolist()
+    valid = ints[:, 6].tolist()
+    alt = ints[:, 7].tolist()
+    sid = ints[:, 8].tolist()
+    masked = ever & (2 | 4 | 32 | 64)
+    if masked == 0 and hexes and not _missing(ints, 0x7F):
+        return [
             {
-                "altitude": None if m & 1 else r[2],
-                "surveillance_status": r[3],
-                "nic_b": r[4],
-                "cpr_format": r[5],
-                "cpr_lat": r[6],
-                "cpr_lon": r[7],
-                "nuc_p": r[8],
+                "df": d,
+                "icao": ic,
+                "typecode": t,
+                "crc": c,
+                "crc_valid": v != 0,
+                "altitude": a,
+                "idcode": s,
             }
-        )
-    return result
-
-
-def _fast_bds06(out, chars=None):
-    if _uniform_masks(out, 9) != 0x7F or not _no_unexpected_none(out, 9, 2 | 4):
-        return rows_generic("bds06", out, chars)
-    frame = out.reshape(-1, 9)
-    # One 2-D conversion so the loop walks per-row lists; groundspeed and track
-    # are the two float fields and the two that can be None (bits 1 and 2).
-    ints = frame.astype(np.int64).tolist()
-    floats = frame[:, 3:5].tolist()
-    result = []
-    append = result.append
-    for k, r in enumerate(ints):
-        m = r[1]
-        fb = floats[k]
-        append(
-            {
-                "movement": r[2],
-                "groundspeed": None if m & 2 else fb[0],
-                "track": None if m & 4 else fb[1],
-                "track_status": r[5],
-                "cpr_format": r[6],
-                "cpr_lat": r[7],
-                "cpr_lon": r[8],
-            }
-        )
-    return result
-
-
-def _fast_bds62(out, chars=None):
-    optional = 2 | 8 | 16 | 256 | 512 | 1024 | 2048 | 4096
-    if _uniform_masks(out, 16) != 0x3FFF or not _no_unexpected_none(out, 16, optional):
-        return rows_generic("bds62", out, chars)
-    frame = out.reshape(-1, 16)
-    # One 2-D conversion, so the loop walks per-row lists rather than striding a
-    # sixteen-million-element flat list. The two float fields come from their
-    # own columns; everything else rides the integer conversion.
-    ints = frame.astype(np.int64).tolist()
-    floats = frame[:, 5:7].tolist()
-    result = []
-    append = result.append
-    for k, r in enumerate(ints):
-        m = r[1]
-        fb = floats[k]
-        append(
-            {
-                "subtype": r[2],
-                "selected_altitude": None if m & 2 else r[3],
-                "selected_altitude_source": BDS62_SOURCE_LIST[r[4]],
-                "baro_pressure_setting": None if m & 8 else fb[0],
-                "selected_heading": None if m & 16 else fb[1],
-                "nac_p": r[7],
-                "nic_baro": r[8],
-                "sil": r[9],
-                "autopilot": None if m & 256 else r[10] != 0,
-                "vnav_mode": None if m & 512 else r[11] != 0,
-                "altitude_hold_mode": None if m & 1024 else r[12] != 0,
-                "approach_mode": None if m & 2048 else r[13] != 0,
-                "lnav_mode": None if m & 4096 else r[14] != 0,
-                "tcas_operational": r[15] != 0,
-            }
-        )
-    return result
-
-
-def _fast_bds65(out, chars=None):
-    # nic_baro and sil_supplement are the only two conditional keys, so the
-    # present mask is 0xFF when neither is carried and 0x3FF when both are.
-    present = _uniform_masks(out, 12)
-    if present not in (0xFF, 0x3FF) or not _no_unexpected_none(out, 12, 0):
-        return rows_generic("bds65", out, chars)
-    table = _ints(out)
-    result = []
-    append = result.append
-    if present == 0x3FF:
-        for i in range(2, len(table), 12):
-            append(
-                {
-                    "subtype": table[i],
-                    "version": table[i + 1],
-                    "nic_supplement_a": table[i + 2],
-                    "nac_p": table[i + 3],
-                    "sil": table[i + 4],
-                    "hrd": table[i + 5],
-                    "capability_class": table[i + 6],
-                    "operational_mode": table[i + 7],
-                    "nic_baro": table[i + 8],
-                    "sil_supplement": table[i + 9],
-                }
+            for d, ic, t, c, v, a, s in zip(df, hexes, tc, crc, valid, alt, sid)
+        ]
+    rows_: list[dict] = []
+    append = rows_.append
+    for k in range(len(df)):
+        p = present_at[k]
+        m = absent_at[k]
+        item = {}
+        if p & 1:
+            item["df"] = None if m & 1 else df[k]
+        if p & 2:
+            item["icao"] = None if m & 2 else (
+                hexes[k] if hexes else f"{int(ints[k, 3]):06X}"
             )
-        return result
-    for i in range(2, len(table), 12):
-        append(
-            {
-                "subtype": table[i],
-                "version": table[i + 1],
-                "nic_supplement_a": table[i + 2],
-                "nac_p": table[i + 3],
-                "sil": table[i + 4],
-                "hrd": table[i + 5],
-                "capability_class": table[i + 6],
-                "operational_mode": table[i + 7],
-            }
-        )
-    return result
+        if p & 4:
+            item["typecode"] = None if m & 4 else tc[k]
+        if p & 8:
+            item["crc"] = None if m & 8 else crc[k]
+        if p & 16:
+            item["crc_valid"] = None if m & 16 else valid[k] != 0
+        if p & 32:
+            item["altitude"] = None if m & 32 else alt[k]
+        if p & 64:
+            item["idcode"] = None if m & 64 else sid[k]
+        append(item)
+    return rows_
 
 
-def _fast_header(out, chars=None):
-    """`util.headers`: df, icao, typecode, crc, crc_valid, altitude, idcode.
+def _build_bds05(width, floats, hexes, blob, ever, present):
+    """BDS 0,5. `altitude` is the only key that can be `None`.
 
-    `icao` is an int in the kernel and a hex string here and `idcode` is an int
-    that becomes an octal squawk, so those two are formatted per row. `icao`,
-    `typecode`, `altitude` and `idcode` are all carried as keys on every
-    message, but their value is None for the downlink formats that do not carry
-    them, which the kernel signals with the absent mask.
+    Both key facts are read from the row: `present` says whether the key is in
+    the dict at all and `absent` whether its value is `None`. That is two mask
+    reads per row, which cost about a tenth of the dict this loop builds, and
+    it is what makes the literal exactly the generic loop for any masks.
     """
-    if _uniform_masks(out, 9) != 0x7F or not _no_unexpected_none(out, 9, 2 | 4 | 32 | 64):
-        return rows_generic("header", out, chars)
-    table = _ints(out)
-    result = []
-    append = result.append
-    for i in range(2, len(table), 9):
-        m = table[i - 1]
-        append(
-            {
-                "df": table[i],
-                "icao": None if m & 2 else f"{table[i + 1]:06X}",
-                "typecode": None if m & 4 else table[i + 2],
-                "crc": table[i + 3],
-                "crc_valid": table[i + 4] != 0,
-                "altitude": None if m & 32 else table[i + 5],
-                "idcode": None if m & 64 else _squawk(table[i + 6]),
-            }
-        )
-    return result
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    alt = ints[:, 2].tolist()
+    ss = ints[:, 3].tolist()
+    nb = ints[:, 4].tolist()
+    cf = ints[:, 5].tolist()
+    la = ints[:, 6].tolist()
+    lo = ints[:, 7].tolist()
+    np_ = ints[:, 8].tolist()
+    rows_: list[dict] = []
+    append = rows_.append
+    for k in range(len(alt)):
+        p = present_at[k]
+        m = absent_at[k]
+        item = {}
+        if p & 1:
+            item["altitude"] = None if m & 1 else alt[k]
+        if p & 2:
+            item["surveillance_status"] = None if m & 2 else ss[k]
+        if p & 4:
+            item["nic_b"] = None if m & 4 else nb[k]
+        if p & 8:
+            item["cpr_format"] = None if m & 8 else cf[k]
+        if p & 16:
+            item["cpr_lat"] = None if m & 16 else la[k]
+        if p & 32:
+            item["cpr_lon"] = None if m & 32 else lo[k]
+        if p & 64:
+            item["nuc_p"] = None if m & 64 else np_[k]
+        append(item)
+    return rows_
 
 
-def _fast_bds08(out, chars=None):
-    """BDS 0,8 always carries all three keys and never a None."""
-    if _uniform_masks(out, 4) != 7 or chars is None or not _no_unexpected_none(out, 4, 0):
-        return rows_generic("bds08", out, chars)
-    table = _ints(out)
-    names = _strings(chars, len(table) // 4, LAYOUTS["bds08"].char_stride)
-    result = []
-    append = result.append
-    for k, r in enumerate(out.reshape(-1, 4).astype(np.int64).tolist()):
-        append(
-            {
-                "callsign": names[k],
-                "category": r[2],
-                "wake_vortex": WAKE_VORTEX_NAMES[r[3]],
-            }
-        )
-    return result
+def _build_bds06(width, floats, hexes, blob, ever, present):
+    """BDS 0,6. `groundspeed` and `track` are the two that can be `None`."""
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    moves = ints[:, 2].tolist()
+    gs = floats[:, 3].tolist()
+    trk = floats[:, 4].tolist()
+    ts = ints[:, 5].tolist()
+    cf = ints[:, 6].tolist()
+    la = ints[:, 7].tolist()
+    lo = ints[:, 8].tolist()
+    rows_: list[dict] = []
+    append = rows_.append
+    for k in range(len(moves)):
+        p = present_at[k]
+        m = absent_at[k]
+        item = {}
+        if p & 1:
+            item["movement"] = None if m & 1 else moves[k]
+        if p & 2:
+            item["groundspeed"] = None if m & 2 else gs[k]
+        if p & 4:
+            item["track"] = None if m & 4 else trk[k]
+        if p & 8:
+            item["track_status"] = None if m & 8 else ts[k]
+        if p & 16:
+            item["cpr_format"] = None if m & 16 else cf[k]
+        if p & 32:
+            item["cpr_lat"] = None if m & 32 else la[k]
+        if p & 64:
+            item["cpr_lon"] = None if m & 64 else lo[k]
+        append(item)
+    return rows_
 
 
-_FAST = {
-    "bds05": _fast_bds05,
-    "bds06": _fast_bds06,
-    "bds08": _fast_bds08,
-    "bds62": _fast_bds62,
-    "bds65": _fast_bds65,
-    "header": _fast_header,
-}
+def _build_bds08(width, floats, hexes, blob, ever, present):
+    """BDS 0,8 always carries all three keys and never a value that is `None`.
+
+    A wake-vortex index outside the table cannot come out of the kernel, and a
+    synthetic buffer that holds one raises here exactly as the generic loop
+    raises, which is the property the tests need.
+    """
+    if ever == 0 and not _missing(floats, 7):
+        ints = floats.astype(np.int64)
+        return [
+            {"category": c, "callsign": cs, "wake_vortex": WAKE_VORTEX_NAMES[w]}
+            for c, cs, w in zip(
+                ints[:, 2].tolist(), _strings(blob, len(ints), 8), ints[:, 3].tolist()
+            )
+        ]
+    return _ordered(floats, width, blob, hexes, "bds08")
+
+
+def _build_bds09(width, floats, hexes, blob, ever, present):
+    """BDS 0,9, whose key set is whatever the row's payload carries.
+
+    A ground-speed row carries `groundspeed` and `track` between `nac_v` and
+    `vertical_rate`; an air-speed row carries heading, airspeed, type and
+    source there; a row of a subtype that carries neither block has only the
+    two common keys. Those three are the feature's shapes, and each is one
+    contiguous run of the field order, so one loop builds all three.
+
+    A row that sets `airspeed_type` or `vr_source` together with a ground key
+    is not any payload's shape: those two keys sit on either side of
+    `vertical_rate`. Such rows are built by the ordered loop, in order, from
+    their own copies of the row.
+    """
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    subtype = ints[:, 2].tolist()
+    nac = ints[:, 3].tolist()
+    gs = ints[:, 4].tolist()
+    trk = floats[:, 5].tolist()
+    hdg = floats[:, 6].tolist()
+    spd = ints[:, 7].tolist()
+    typ = ints[:, 8].tolist()
+    src = ints[:, 9].tolist()
+    vr = ints[:, 10].tolist()
+    gmb = ints[:, 11].tolist()
+    rows_: list[dict] = [{}] * len(present_at)
+    slow: list[int] = []
+    for k in range(len(present_at)):
+        p = present_at[k]
+        # A row with bits from both blocks, or with both of the ground keys
+        # plus any air key, cannot be written as one contiguous run here.
+        air = p & 0x38C
+        ground = p & 0x0C
+        if (air and ground) or ((p & 0x04 or p & 0x08) and p & 0x380):
+            slow.append(k)
+            continue
+        m = absent_at[k]
+        item: dict = {}
+        if p & 1:
+            item["subtype"] = None if m & 1 else subtype[k]
+        if p & 2:
+            item["nac_v"] = None if m & 2 else nac[k]
+        if p & 0x0F0 and not p & 0x0C:
+            if p & 16:
+                item["heading"] = None if m & 16 else hdg[k]
+            if p & 32:
+                item["airspeed"] = None if m & 32 else spd[k]
+            if p & 64:
+                item["airspeed_type"] = None if m & 64 else ("TAS" if typ[k] == 1 else "IAS")
+            if p & 128:
+                item["vr_source"] = None if m & 128 else ("BARO" if src[k] == 1 else "GNSS")
+        elif p & 0x0C and not p & 0x38C:
+            if p & 4:
+                item["groundspeed"] = None if m & 4 else gs[k]
+            if p & 8:
+                item["track"] = None if m & 8 else trk[k]
+        if p & 256:
+            item["vertical_rate"] = None if m & 256 else vr[k]
+        if p & 512:
+            item["geo_minus_baro"] = None if m & 512 else gmb[k]
+        rows_[k] = item
+    if slow:
+        block = floats[slow]
+        for k, item in zip(slow, _ordered(block, width, blob, hexes, "bds09")):
+            rows_[k] = item
+    return rows_
+
+
+def _build_bds62(width, floats, hexes, blob, ever, present):
+    """BDS 6,2, whose source column indexes a three-entry name table."""
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    st = ints[:, 2].tolist()
+    sas = ints[:, 3].tolist()
+    src = ints[:, 4].tolist()
+    baro = floats[:, 5].tolist()
+    hdg = floats[:, 6].tolist()
+    nac = ints[:, 7].tolist()
+    nicb = ints[:, 8].tolist()
+    sil = ints[:, 9].tolist()
+    ap = ints[:, 10].tolist()
+    vn = ints[:, 11].tolist()
+    ahm = ints[:, 12].tolist()
+    app = ints[:, 13].tolist()
+    ln = ints[:, 14].tolist()
+    tcas = ints[:, 15].tolist()
+    rows_: list[dict] = []
+    append = rows_.append
+    for k in range(len(st)):
+        p = present_at[k]
+        m = absent_at[k]
+        item = {}
+        if p & 1:
+            item["subtype"] = None if m & 1 else st[k]
+        if p & 2:
+            item["selected_altitude"] = None if m & 2 else sas[k]
+        if p & 4:
+            item["selected_altitude_source"] = None if m & 4 else BDS62_SOURCE_LIST[src[k]]
+        if p & 8:
+            item["baro_pressure_setting"] = None if m & 8 else baro[k]
+        if p & 16:
+            item["selected_heading"] = None if m & 16 else hdg[k]
+        if p & 32:
+            item["nac_p"] = None if m & 32 else nac[k]
+        if p & 64:
+            item["nic_baro"] = None if m & 64 else nicb[k]
+        if p & 128:
+            item["sil"] = None if m & 128 else sil[k]
+        if p & 256:
+            item["autopilot"] = None if m & 256 else ap[k] != 0
+        if p & 512:
+            item["vnav_mode"] = None if m & 512 else vn[k] != 0
+        if p & 1024:
+            item["altitude_hold_mode"] = None if m & 1024 else ahm[k] != 0
+        if p & 2048:
+            item["approach_mode"] = None if m & 2048 else app[k] != 0
+        if p & 4096:
+            item["lnav_mode"] = None if m & 4096 else ln[k] != 0
+        if p & 8192:
+            item["tcas_operational"] = None if m & 8192 else tcas[k] != 0
+        append(item)
+    return rows_
+
+
+def _build_bds65(width, floats, hexes, blob, ever, present):
+    """BDS 6,5: eight keys always, `nic_baro` and `sil_supplement` sometimes.
+
+    The kernel writes the same present mask on every row of a batch (0xFF,
+    0x3FF, or the shapes a subtype adds up to), so the key set is one fact for
+    the batch; a row's own absent mask still decides which value is `None`.
+    """
+    ints = floats.astype(np.int64)
+    present_at = ints[:, 0].tolist()
+    absent_at = ints[:, 1].tolist()
+    st = ints[:, 2].tolist()
+    ver = ints[:, 3].tolist()
+    nsa = ints[:, 4].tolist()
+    nac = ints[:, 5].tolist()
+    sil = ints[:, 6].tolist()
+    hrd = ints[:, 7].tolist()
+    cc = ints[:, 8].tolist()
+    om = ints[:, 9].tolist()
+    nicb = ints[:, 10].tolist()
+    sils = ints[:, 11].tolist()
+    rows_: list[dict] = []
+    append = rows_.append
+    for k in range(len(st)):
+        p = present_at[k]
+        m = absent_at[k]
+        item = {}
+        if p & 1:
+            item["subtype"] = None if m & 1 else st[k]
+        if p & 2:
+            item["version"] = None if m & 2 else ver[k]
+        if p & 4:
+            item["nic_supplement_a"] = None if m & 4 else nsa[k]
+        if p & 8:
+            item["nac_p"] = None if m & 8 else nac[k]
+        if p & 16:
+            item["sil"] = None if m & 16 else sil[k]
+        if p & 32:
+            item["hrd"] = None if m & 32 else hrd[k]
+        if p & 64:
+            item["capability_class"] = None if m & 64 else cc[k]
+        if p & 128:
+            item["operational_mode"] = None if m & 128 else om[k]
+        if p & 256:
+            item["nic_baro"] = None if m & 256 else nicb[k]
+        if p & 512:
+            item["sil_supplement"] = None if m & 512 else sils[k]
+        append(item)
+    return rows_
+
+
+_BUILDERS.update(
+    {
+        "header": _build_header,
+        "bds05": _build_bds05,
+        "bds06": _build_bds06,
+        "bds08": _build_bds08,
+        "bds09": _build_bds09,
+        "bds62": _build_bds62,
+        "bds65": _build_bds65,
+    }
+)
 
 
 def one(name: str, out: np.ndarray, chars: np.ndarray | None = None) -> dict:

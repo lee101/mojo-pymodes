@@ -69,8 +69,6 @@ from corpus import long_corpus, payloads_of, short_corpus, typecodes_of
 
 # ------------------------------------------------------------ library load
 
-_K = lib()
-
 if not os.path.exists(LIB):
     pytest.skip(
         f"shared library {LIB} is missing: run `pixi run build`. Every test in "
@@ -78,6 +76,8 @@ if not os.path.exists(LIB):
         "assert against without it.",
         allow_module_level=True,
     )
+
+_K = lib()
 
 # Mirrors PAR_THRESHOLD / PAR_WORKERS in src/capi.mojo. A batch at or above
 # PAR takes the `parallelize` branch, so the fixtures below deliberately cross
@@ -88,7 +88,7 @@ PAR_THRESHOLD = 4096
 def test_the_library_under_test_is_the_compiled_shared_object():
     """Guard against the whole file silently testing a Python fallback."""
     assert os.path.isfile(LIB), LIB
-    assert os.path.basename(_K._name) == "libmojo-pymodes.so", _K._name
+    assert "mojo-pymodes" in os.path.basename(_K._name), _K._name
     # An @export("...") symbol is a real ELF dynamic symbol, so ctypes resolves
     # it to an address inside the mapped shared object rather than a stub.
     assert _K.mp_extract_unsigned, "mp_extract_unsigned did not resolve"

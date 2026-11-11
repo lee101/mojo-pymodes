@@ -90,6 +90,21 @@ def test_bds05_batch_matches_upstream():
     assert got == [ref_bds05(p, tc=t) for p, t in zip(pl, tcs)]
 
 
+def test_bds05_batch_refuses_a_typecode_column_of_the_wrong_length():
+    """The kernel reads `n` typecodes whatever the caller passed.
+
+    A shorter column would make it read past the caller's buffer, so the
+    wrapper refuses it before the FFI call instead of decoding garbage.
+    """
+    pl = [int(m[8:22], 16) for m in LONG[:8]]
+    for tcs in ([9], [], [9, 10], LONG[:4]):
+        with pytest.raises(ValueError):
+            pm.decoder.bds.decode_bds05_batch(pl, tcs)
+    # A lone payload is one element, so the same guard accepts a scalar tc.
+    one = pm.decoder.bds.decode_bds05(pl[0], tc=9)
+    assert one == ref_bds05(pl[0], tc=9)
+
+
 def test_crc_batch_is_exposed_at_the_top_level():
     from mojopymodes._bits import crc_remainders
 

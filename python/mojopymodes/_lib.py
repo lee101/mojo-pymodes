@@ -12,9 +12,15 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "src")
-LIB = os.environ.get("MOJOPYMODES_LIB") or os.path.join(
-    ROOT, "dist", "libmojo-pymodes.so"
-)
+_DEFAULT_LIB = os.path.join(ROOT, "dist", "libmojo-pymodes.so")
+# The library path is read at call time, so MOJOPYMODES_LIB works whether it is
+# set before import (the usual case) or by a test afterwards.
+LIB = os.environ.get("MOJOPYMODES_LIB") or _DEFAULT_LIB
+
+
+def library_path() -> str:
+    """Where the shared library is expected: the override, or `dist/`."""
+    return os.environ.get("MOJOPYMODES_LIB") or LIB
 
 # Mirrors the PAR_THRESHOLD / PAR_WORKERS constants in src/capi.mojo: below the
 # threshold a batch runs on one thread, at or above it the kernel fans out
@@ -72,39 +78,93 @@ class BuildError(RuntimeError):
     pass
 
 
+def _toolchain_home(mojo_bin: str) -> str | None:
+    """The package root (`share/max`) for a `mojo` from a conda environment.
+
+    The conda package's activation script exports
+    `MODULAR_HOME=$CONDA_PREFIX/share/max`, which is where the compiler looks
+    for `std` and `max`. `mojo` lives in `<prefix>/bin`, so the prefix is its
+    grandparent directory. A prefix can be usable even before the first run
+    creates `share/max`, so its existence is not the test; a missing
+    `MODULAR_HOME` or one pointing at a path that does not exist is.
+    """
+    prefix = os.path.dirname(os.path.dirname(os.path.realpath(mojo_bin)))
+    if not os.path.isfile(os.path.join(prefix, "lib", "mojo", "algorithm.mojoc")):
+        return None
+    return os.path.join(prefix, "share", "max")
+
+
+def _toolchain_env(mojo_bin: str) -> dict[str, str]:
+    """`os.environ` with `MODULAR_HOME` pointed at `mojo_bin`'s toolchain."""
+    env = dict(os.environ)
+    home = _toolchain_home(mojo_bin)
+    if home is not None:
+        env["MODULAR_HOME"] = home
+    return env
+
+
 def mojo_command() -> list[str]:
+    """The command prefix that compiles one Mojo file.
+
+    `mojo build` on its own has no `std` outside the environment it shipped
+    in, so a `mojo` from a conda prefix is run with that prefix's
+    `MODULAR_HOME`, and `pixi run` is the fallback that sets it up.
+    """
     override = os.environ.get("MOJOPYMODES_MOJO")
     if override:
         return override.split()
     found = shutil.which("mojo")
-    if found:
+    if found and _toolchain_home(found) is not None:
         return [found]
     pixi = shutil.which("pixi") or os.path.expanduser("~/.pixi/bin/pixi")
     if os.path.exists(pixi) and os.path.exists(os.path.join(ROOT, "pixi.toml")):
+        # `--` keeps pixi's own flag parsing out of the mojo arguments.
         return [
             pixi,
             "run",
             "--manifest-path",
             os.path.join(ROOT, "pixi.toml"),
+            "--",
             "mojo",
         ]
+    if found:
+        return [found]
     raise BuildError("mojo not found; set MOJOPYMODES_MOJO=/path/to/mojo")
 
 
 def build(force: bool = False) -> str:
-    """Compile `src/capi.mojo` into `dist/libmojo-pymodes.so` if it is stale."""
+    """Compile `src/capi.mojo` into `dist/libmojo-pymodes.so` if it is stale.
+
+    An explicit `MOJOPYMODES_LIB` is used as given: it is a library the caller
+    already built, so there is nothing to rebuild (unless `force`), and a
+    packaged install has no `src/` next to it to rebuild from.
+    """
+    target = library_path()
+    if os.environ.get("MOJOPYMODES_LIB") and not force:
+        if not os.path.isfile(target):
+            raise BuildError(
+                f"MOJOPYMODES_LIB points at {target}, which does not exist"
+            )
+        return target
     sources = [
         os.path.join(dirpath, name)
         for dirpath, _, names in os.walk(SRC)
         for name in names
         if name.endswith(".mojo")
     ]
-    if not force and os.path.exists(LIB):
+    if not sources:
+        raise BuildError(
+            f"no Mojo sources under {SRC}; build the library first and point "
+            "MOJOPYMODES_LIB at it"
+        )
+    if not force and os.path.exists(target):
         newest = max(os.path.getmtime(s) for s in sources)
-        if os.path.getmtime(LIB) >= newest:
-            return LIB
-    os.makedirs(os.path.dirname(LIB), exist_ok=True)
-    cmd = mojo_command() + [
+        if os.path.getmtime(target) >= newest:
+            return target
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    cmd = mojo_command()
+    env = _toolchain_env(cmd[0]) if os.path.basename(cmd[0]).startswith("mojo") else None
+    cmd = cmd + [
         "build",
         "--emit",
         "shared-lib",
@@ -112,12 +172,12 @@ def build(force: bool = False) -> str:
         SRC,
         os.path.join(SRC, "capi.mojo"),
         "-o",
-        LIB,
+        target,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if proc.returncode != 0 or not os.path.exists(LIB):
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+    if proc.returncode != 0 or not os.path.exists(target):
         raise BuildError((proc.stderr or proc.stdout).strip()[:4000])
-    return LIB
+    return target
 
 
 _lib = None
@@ -164,6 +224,28 @@ def scratch_2f() -> np.ndarray:
 
 def scratch_16u8() -> np.ndarray:
     return np.zeros(16, dtype=np.uint8)
+
+
+_ARRAY = (list, tuple, np.ndarray)
+
+
+def _count(value) -> int:
+    """Elements of `value` that the batch wrappers are about to read."""
+    return len(value) if isinstance(value, _ARRAY) else 1
+
+
+def same_length(name: str, *columns) -> None:
+    """Refuse batch columns that are not all the same length.
+
+    The kernels read `n` elements from every column. A scalar or a shorter
+    column would be read past its end, silently, so it is rejected here.
+    """
+    counts = {_count(c) for c in columns}
+    if len(counts) > 1:
+        raise ValueError(
+            f"{name}: columns of different length {sorted(counts)}; "
+            "pass one value per message"
+        )
 
 # A 256-entry table turning a hex ASCII byte into its nibble. Covers 0-9, A-F
 # and a-f; the remaining byte values map to 0, which is what a padded (and

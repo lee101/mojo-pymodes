@@ -54,6 +54,12 @@ def main() -> None:
     k = lib()
     layout = LAYOUTS["bds05"]
 
+    def decode_one():
+        """One record through the kernel: the fixed cost of a decode."""
+        out = out_f64(1, layout.width)
+        k.mp_decode_bds05(addr(p), addr(t), 1, addr(out))
+        return out
+
     def kernel_only():
         """Exactly the FFI call: one kernel, no Python-side row assembly."""
         out = out_f64(n, layout.width)
@@ -66,6 +72,7 @@ def main() -> None:
 
     a = best_of(kernel_only)
     b = best_of(kernel_plus_dicts)
+    one = best_of(decode_one)
     print(f"n = {n}")
     print(f"bds05 kernel only       : {a * 1e3:8.1f} ms  ({a / n * 1e9:6.1f} ns/msg)")
     print(f"bds05 through the API   : {b * 1e3:8.1f} ms  ({b / n * 1e9:6.1f} ns/msg)")
@@ -74,6 +81,10 @@ def main() -> None:
         f"({100 * (b - a) / b:.1f}% of the API time)"
     )
     print(f"kernel is {b / a:.0f}x faster than the API that wraps it")
+    # The one-record path is what upstream has to compete with, and its cost is
+    # a fixed ctypes call, not a share of the kernel: the benchmark's "single
+    # cprNL call" case is the same effect on a cheaper kernel.
+    print(f"one bds05 record        : {one * 1e3:8.3f} ms  ({one * 1e6:6.1f} us/record)")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-"""A/B the fast paths against `rows_generic` on identical kernel output.
+"""A/B the `rows()` builders against the generic reference, same kernel output.
 
-Both are timed in the same process on the same buffer, so the machine load
-that moves the absolute numbers between runs cancels out.
+Both sides read one buffer that the kernel filled once, so this measures the
+Python-side assembly only. Run it under the bench lock, like `bench.py`:
 
     flock /tmp/mojo-bench.lock pixi run python bench/ab_rows.py
 """
@@ -12,9 +12,9 @@ import os
 import sys
 import time
 
-import numpy as np
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python")
+)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests"))
 
 import corpus  # noqa: E402
@@ -23,49 +23,53 @@ from mojopymodes._layout import LAYOUTS, rows, rows_generic  # noqa: E402
 from mojopymodes._lib import addr, i64, lib, out_f64, out_u8  # noqa: E402
 
 N = 1_000_000
-REPEAT = 5
+NAMES = ("bds08", "bds05", "bds62")
 
 
-def best_of(fn, repeat=REPEAT):
+def best_of(fn, repeat=3) -> float:
     best = float("inf")
     for _ in range(repeat):
-        t0 = time.perf_counter()
+        start = time.perf_counter()
         fn()
-        best = min(best, time.perf_counter() - t0)
+        best = min(best, time.perf_counter() - start)
     return best
+
+
+def fill(name: str, payloads) -> tuple[object, object]:
+    """Run one kernel over `payloads`; return (float rows, char block or None)."""
+    layout = LAYOUTS[name]
+    p = i64(payloads)
+    n = p.size
+    out = out_f64(n, layout.width)
+    buf = out_u8(n, layout.char_stride) if layout.char_stride else None
+    args = [addr(p)]
+    tcs = None
+    if name == "bds05":
+        # Bound to a local, not built inline: `addr(i64([...]))` lets numpy
+        # free the column before the kernel reads it.
+        tcs = i64([9 + (i % 14) for i in range(n)])
+        args.append(addr(tcs))
+    args += [n, addr(out)]
+    if buf is not None:
+        args.append(addr(buf))
+    getattr(lib(), "mp_decode_" + name)(*args)
+    # Both buffers outlive the call and the timed functions below.
+    return out, buf
 
 
 def main() -> None:
     base = corpus.long_corpus()
-    payloads = [int(m[8:22], 16) for m in (base[i % len(base)] for i in range(N))]
-    tcs = [int(m[8:10], 16) >> 3 for m in base]
-    tcs = [tcs[i % len(tcs)] for i in range(N)]
-    p = i64(payloads)
-    t = i64(tcs)
-    k = lib()
-
-    cases = [("bds05", "mp_decode_bds05", True), ("bds08", "mp_decode_bds08", False),
-             ("bds09", "mp_decode_bds09", False), ("bds62", "mp_decode_bds62", False)]
-    print(f"{'case':8s} {'generic':>12s} {'fast':>12s} {'speedup':>9s}  equal")
-    for name, sym, extra in cases:
-        layout = LAYOUTS[name]
-        out = out_f64(N, layout.width)
-        buf = out_u8(N, layout.char_stride) if layout.char_stride else None
-        fn = getattr(k, sym)
-        if extra:
-            fn(addr(p), addr(t), N, addr(out))
-        elif layout.char_stride:
-            fn(addr(p), N, addr(out), addr(buf))
-        else:
-            fn(addr(p), N, addr(out))
-        a = best_of(lambda: rows_generic(name, out, buf))
-        b = best_of(lambda: rows(name, out, buf))
-        same = rows(name, out, buf) == rows_generic(name, out, buf)
+    payloads = [int(base[i % len(base)][8:22], 16) for i in range(N)]
+    for name in NAMES:
+        out, buf = fill(name, payloads)
+        fast = best_of(lambda: rows(name, out, buf))
+        slow = best_of(lambda: rows_generic(name, out, buf))
+        rows(name, out, buf)  # sanity: the two must agree before timing is quoted
+        assert rows(name, out, buf) == rows_generic(name, out, buf), name
         print(
-            f"{name:8s} {a / N * 1e9:9.0f} ns {b / N * 1e9:9.0f} ns {a / b:8.2f}x  {same}",
-            flush=True,
+            f"{name:6s} builder {fast / N * 1e9:7.0f} ns/row   "
+            f"generic {slow / N * 1e9:7.0f} ns/row   {slow / fast:.2f}x"
         )
-        del out, buf
 
 
 if __name__ == "__main__":

@@ -90,6 +90,42 @@ def test_is_valid_callsign_char(idx):
     assert is_valid_callsign_char(idx) == ref_valid_char(idx)
 
 
+def test_is_valid_callsign_char_matches_upstream_off_the_table():
+    """Negative indexes count from the end, exactly as upstream's tuple does."""
+    for idx in (-1, -2, -35, -36, -37, -63, -64):
+        assert is_valid_callsign_char(idx) == ref_valid_char(idx), idx
+    for idx in (64, 65, 1 << 20):
+        with pytest.raises(IndexError):
+            ref_valid_char(idx)
+        with pytest.raises(IndexError):
+            is_valid_callsign_char(idx)
+
+
+def _port_table() -> str:
+    """The port's table, read back from src/tables.mojo."""
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "src", "tables.mojo")).read()
+    body = text.split("comptime _CALLSIGN_TABLE", 1)[1].split("\n)", 1)[0]
+    return "".join(chr(int(v)) for v in re.findall(r"\d+", body.split("(", 1)[1]))
+
+
+def test_callsign_index_zero_never_reaches_the_string_buffer():
+    """The port's table has no NUL, and no decoded string ever carries one.
+
+    Upstream's slot 0 is chr(0), which a `(buffer, length)` ABI cannot carry;
+    the port stores the '#' sentinel instead. Slot 0 is only read by a payload
+    whose first slot is themselves invalid, so nothing a real callsign encodes
+    changes -- the padding and strip cases above are bit-identical.
+    """
+    assert is_valid_callsign_char(0) == ref_valid_char(0)
+    assert _port_table()[0] == "#"
+    assert "\x00" not in _port_table()
+    assert "\x00" not in decode_callsign(0)
+
+
 def test_callsign_batch_empty():
     assert decode_callsigns([]) == []
     assert idcodes_to_squawks([]) == []

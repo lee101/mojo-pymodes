@@ -173,3 +173,33 @@ def test_every_covered_name_is_reachable_from_the_package_root():
         assert hasattr(pm, name) or hasattr(pm.util, name) or hasattr(
             pm.position, name
         ) or hasattr(pm.decoder.bds, name), name
+
+
+def test_no_extra_upstream_names_are_promised():
+    """The package root only exposes names this repo actually implements.
+
+    Every upstream *function* this repo covers is listed above; everything
+    else public on the root here is an addition or one of the supporting
+    modules, not a claim of a pyModeS name that does not exist.
+    """
+    added = {
+        "altcodes_to_altitudes",
+        "decode_callsigns",
+        "decode_fields",
+        "headers",
+        "idcodes_to_squawks",
+        "payload",
+        "payloads",
+        "airborne_position_pair_batch",
+        "airborne_position_with_ref_batch",
+        "cprNL_batch",
+        "surface_position_pair_batch",
+        "surface_position_with_ref_batch",
+    }
+    modules = {"decoder", "position", "util", "batch"}
+    public = {
+        n for n in dir(pm)
+        if not n.startswith("_") and n != "annotations"
+    }
+    known = set(SURFACE) | added | modules | {"__version__"}
+    assert public - known == set(), sorted(public - known)

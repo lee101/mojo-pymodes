@@ -31,7 +31,13 @@ def test_crc_table():
 def test_callsign_table():
     from pyModeS._callsign import _CALLSIGN_TABLE
 
-    assert _literals("_CALLSIGN_TABLE", "UInt8") == [ord(c) for c in _CALLSIGN_TABLE]
+    # Index 0 is the one deliberate difference: upstream holds chr(0) there,
+    # this port holds the "#" sentinel, because a NUL cannot terminate a
+    # string that crosses the C ABI. Every other entry is upstream's byte.
+    assert _literals("_CALLSIGN_TABLE", "UInt8")[1:] == [
+        ord(c) for c in _CALLSIGN_TABLE[1:]
+    ]
+    assert _literals("_CALLSIGN_TABLE", "UInt8")[0] == ord("#")
 
 
 def test_nl_boundaries():
@@ -70,7 +76,9 @@ def test_generator_reproduces_every_table():
     spec.loader.exec_module(gen)
 
     assert _literals("_CRC_TABLE", "Int") == gen.crc_table()
-    assert _literals("_CALLSIGN_TABLE", "UInt8") == gen.callsign_table()
+    callsign = _literals("_CALLSIGN_TABLE", "UInt8")
+    assert callsign[0] == ord("#")
+    assert callsign[1:] == gen.callsign_table()[1:]
     assert _literals("_NL_BOUNDARIES", "Float64") == gen.nl_boundaries()
     assert _literals("TC_NUCp_lookup", "Int") == gen.nucp_table()
     assert _literals("_WAKE_VORTEX", "Int") == gen.wake_vortex_table()

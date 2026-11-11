@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from .._lib import addr, f64, i64, lib, out_f64, scratch_2f
+from .._lib import addr, f64, i64, lib, out_f64, same_length, scratch_2f
 
 
 def cprNL(lat: float) -> int:
@@ -115,6 +115,8 @@ def airborne_position_pair_batch(
     lat_o = i64(cpr_lat_odd_raw)
     lon_o = i64(cpr_lon_odd_raw)
     newer = i64(even_is_newer)
+    same_length("airborne_position_pair_batch",
+                lat_e, lon_e, lat_o, lon_o, newer)
     n = lat_e.size
     if n == 0:
         return []
@@ -145,6 +147,8 @@ def surface_position_pair_batch(
     ref_lat = f64(lat_ref)
     ref_lon = f64(lon_ref)
     newer = i64(even_is_newer)
+    same_length("surface_position_pair_batch",
+                lat_e, lon_e, lat_o, lon_o, ref_lat, ref_lon, newer)
     n = lat_e.size
     if n == 0:
         return []
@@ -179,6 +183,8 @@ def airborne_position_with_ref_batch(
     lon = i64(cpr_lon_raw)
     ref_lat = f64(lat_ref)
     ref_lon = f64(lon_ref)
+    same_length("airborne_position_with_ref_batch",
+                fmt, lat, lon, ref_lat, ref_lon)
     n = fmt.size
     if n == 0:
         return []
@@ -202,6 +208,8 @@ def surface_position_with_ref_batch(
     lon = i64(cpr_lon_raw)
     ref_lat = f64(lat_ref)
     ref_lon = f64(lon_ref)
+    same_length("surface_position_with_ref_batch",
+                fmt, lat, lon, ref_lat, ref_lon)
     n = fmt.size
     if n == 0:
         return []

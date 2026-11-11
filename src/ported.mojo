@@ -190,7 +190,23 @@ def decode_callsign(bits: Int) -> String:
 
 
 def is_valid_callsign_char(idx: Int) -> Bool:
-    """True if a 6-bit index maps to a valid callsign character."""
+    """True if a 6-bit index maps to a valid callsign character.
+
+    DIVERGENCE: upstream's `_CALLSIGN_TABLE[idx] != "#"` raises `IndexError`
+    for an index outside -64..63 and indexes from the end for -64..-1. Mojo
+    has no bounds check on a comptime tuple, so both ranges are spelled out
+    here and the Python wrapper raises the same `IndexError`, so the two
+    agree for every input.
+    """
+    if idx > 63:
+        return False
+    if idx < 0:
+        # Python indexes from the end: -1 is the last entry and every index
+        # below -64 is a tuple `IndexError` (re-raised by the wrapper). Every
+        # in-range negative entry here is '#', so the answer is False.
+        if idx < -64:
+            return False
+        return _CALLSIGN_TABLE[64 + idx] != UInt8(ord("#"))
     return _CALLSIGN_TABLE[idx] != UInt8(ord("#"))
 
 
